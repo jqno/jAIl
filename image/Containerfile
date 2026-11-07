@@ -1,0 +1,9 @@
+FROM registry.fedoraproject.org/fedora:45
+RUN dnf -y install nodejs npm git ripgrep fd-find curl findutils util-linux tinyproxy && dnf clean all
+RUN npm i -g opencode-ai && npm cache clean --force
+RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} +
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
+COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY boot.sh /usr/local/bin/boot.sh
+ENTRYPOINT ["/usr/local/bin/boot.sh"]
+CMD ["opencode"]
