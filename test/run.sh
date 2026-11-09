@@ -152,6 +152,32 @@ check "refuses login outside every profile" exited 1
 
 egress='for h in api.greenpt.ai api.githubcopilot.com; do curl -s -o /dev/null -w "%{http_code} $h\n" "https://$h/"; done'
 
+section "New profile"
+new_in() { # fake home, jail arguments...
+  out=$(HOME=$1 "$jail" new "${@:2}" 2>&1)
+  status=$?
+}
+mkdir -p "$tmp/bare-home" "$tmp/oc-home/.config/opencode"
+echo hi >"$tmp/oc-home/.config/opencode/AGENTS.md"
+mv "$tmp/conf/masks" "$tmp/masks"
+new_in "$tmp/bare-home" t-new
+check "works without ~/.config/opencode" exited 0
+check "...with an allowlist" grep -qx models.dev "$tmp/conf/profiles/t-new/allowlist"
+check "...and paths that match no projects yet" test -z "$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$tmp/conf/profiles/t-new/paths")"
+check "...and an empty OpenCode config" test -z "$(ls -A "$tmp/conf/profiles/t-new/home/.config/opencode")"
+check "...and default masks" grep -qx '.env.*' "$tmp/conf/masks"
+check "...and points to the README" has "README"
+echo custom >"$tmp/conf/masks"
+new_in "$tmp/oc-home" t-new2
+check "doesn't copy the host's OpenCode config" test -z "$(ls -A "$tmp/conf/profiles/t-new2/home/.config/opencode")"
+check "keeps existing masks" grep -qx custom "$tmp/conf/masks"
+new_in "$tmp/bare-home" t-new
+check "refuses an existing profile" has "already exists"
+new_in "$tmp/bare-home" ../x
+check "refuses a bad name" exited 1
+mv "$tmp/masks" "$tmp/conf/masks"
+rm -rf "$tmp/conf/profiles/t-new" "$tmp/conf/profiles/t-new2"
+
 section "Hobby project"
 sandbox hobby/plain "$egress; pwd; cat .env"
 check "boot checks pass" booted

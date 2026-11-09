@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # jAIl: run OpenCode for the current project in a rootless Podman microVM.
-# Usage: jail [-- opencode-args] | jail shell | jail login | jail build
+# Usage: jail [-- opencode-args] | jail shell | jail login | jail new <profile> | jail build
 set -euo pipefail
 
 conf="$HOME/.config/jail"
@@ -87,6 +87,20 @@ login() {
   exec podman run "${base[@]}" -v "$volume:$HOME" --entrypoint opencode jail auth login
 }
 
+# Create a profile, and the masks file if there isn't one.
+new_profile() {
+  if [[ ! ${1:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then die "usage: jail new <profile>, a name of letters, digits, _ . -"; fi
+  use_profile "$1"
+  if [[ -e $dir ]]; then die "$dir already exists"; fi
+  mkdir -p "$dir/home/.config/opencode"
+  echo "# Project paths for this profile, one glob per line, such as ~/src/*" >"$dir/paths"
+  printf '%s\n' "# Hosts this profile can reach, one per line" models.dev models.opencode.ai >"$dir/allowlist"
+  if [[ ! -e $conf/masks ]]; then
+    printf '%s\n' "# File names to hide in every project, one per line" .env '.env.*' >"$conf/masks"
+  fi
+  echo "jAIl: created profile $1; review the files in $conf before use, the README explains each one"
+}
+
 # Rebuild the image from scratch and remove the proxies, so they restart on the new image.
 build() {
   local src proxies
@@ -134,6 +148,7 @@ run() { # podman run arguments after the options: image and command
 
 case ${1:-} in
   login) login ;;
+  new) new_profile "${2:-}" ;;
   build) build ;;
   shell) run --entrypoint bash jail ;;
   --) run jail opencode "${@:2}" ;;

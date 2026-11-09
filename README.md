@@ -110,6 +110,7 @@ jAIl ▸ booting profile work
 | `jail` | Start OpenCode for the current project. |
 | `jail -- <args>` | Same, passing `<args>` to OpenCode. |
 | `jail shell` | Bash instead of OpenCode, with the same mounts. Skips the boot checks; run `boot.sh true` to see them. |
+| `jail new <profile>` | Create a profile in `~/.config/jail/profiles/`, with an empty `paths`, a starter `allowlist` and an empty `home/.config/opencode/`. Also creates a default `masks` if there isn't one. |
 | `jail login` | Log in to a provider (`opencode auth login`) for the current project's profile. The login is shared by all projects in that profile. Runs with normal internet and no project mounted. |
 
 The project is the git root, or the current directory outside git. Git worktrees work too, also when the main repository is somewhere else.
