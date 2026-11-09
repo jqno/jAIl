@@ -24,7 +24,7 @@ You need Linux with KVM, Bash 4+, rootless Podman 4+ with the krun runtime, and 
    ```
 2. Build the image. The agent and the proxies both use it.
    ```
-   podman build -t jail image/
+   ./jail build
    ```
 3. Put the launcher on your `PATH`:
    ```
@@ -171,7 +171,7 @@ Don't share the host's `~/.m2/repository` (or similar caches) with the agent. It
 
 ### Compilers and build tools
 
-The image contains OpenCode, git and a few basic tools, but no compilers or build tools. Add what the agent needs to `image/Containerfile` and rebuild.
+The image contains OpenCode, git and a few basic tools, but no compilers or build tools. Add what the agent needs to `image/Containerfile` and run `jail build`. Run it now and then anyway, to get updates.
 
 JVM tools don't use `https_proxy` either. Add this to the Containerfile, and add `JAVA_TOOL_OPTIONS` to `allowed_env` in `image/boot.sh`:
 ```

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # jAIl: run OpenCode for the current project in a rootless Podman microVM.
-# Usage: jail [-- opencode-args] | jail shell | jail login
+# Usage: jail [-- opencode-args] | jail shell | jail login | jail build
 set -euo pipefail
 
 conf="$HOME/.config/jail"
@@ -87,6 +87,15 @@ login() {
   exec podman run "${base[@]}" -v "$volume:$HOME" --entrypoint opencode jail auth login
 }
 
+# Rebuild the image from scratch and remove the proxies, so they restart on the new image.
+build() {
+  local src proxies
+  src=$(dirname "$(readlink -f "$0")")/image
+  podman build --pull=always --no-cache -t jail "$src"
+  mapfile -t proxies < <(podman container ls -a --format '{{.Names}}' | grep -E '^jail-.+-proxy$' || true)
+  if ((${#proxies[@]} > 0)); then podman rm -f "${proxies[@]}" >/dev/null; fi
+}
+
 run() { # podman run arguments after the options: image and command
   local cwd proj gitdir found masked f args m
   find_project
@@ -125,6 +134,7 @@ run() { # podman run arguments after the options: image and command
 
 case ${1:-} in
   login) login ;;
+  build) build ;;
   shell) run --entrypoint bash jail ;;
   --) run jail opencode "${@:2}" ;;
   *) run jail opencode "$@" ;;
