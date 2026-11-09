@@ -1,156 +1,220 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 # jAIl: run OpenCode for the current project in a rootless Podman microVM.
 # Usage: jail [-- opencode-args] | jail shell | jail login | jail new <profile> | jail build
-set -euo pipefail
+# Needs Python 3.9+ and nothing outside the standard library.
+import os
+import re
+import subprocess
+import sys
+from collections import namedtuple
+from fnmatch import fnmatchcase
+from glob import glob
 
-conf="$HOME/.config/jail"
-proxy=http://jail-proxy:8888
-base=(
-  --rm -it
-  --runtime krun --annotation krun.cpus=4 --annotation krun.ram_mib=8192
-  --userns=keep-id --cap-drop ALL --security-opt no-new-privileges
-  --env-host=false --http-proxy=false
-  -e HOME="$HOME" -e TERM="${TERM:-}" -e COLORTERM="${COLORTERM:-}" -e LANG="${LANG:-}"
-)
+HOME = os.environ["HOME"]
+CONF = os.path.join(HOME, ".config/jail")
+PROXY = "http://jail-proxy:8888"
+BASE = [
+    "--rm", "-it",
+    "--runtime", "krun", "--annotation", "krun.cpus=4", "--annotation", "krun.ram_mib=8192",
+    "--userns=keep-id", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+    "--env-host=false", "--http-proxy=false",
+    "-e", f"HOME={HOME}",
+    "-e", f"TERM={os.environ.get('TERM', '')}",
+    "-e", f"COLORTERM={os.environ.get('COLORTERM', '')}",
+    "-e", f"LANG={os.environ.get('LANG', '')}",
+]
 
-die() {
-  echo "jAIl: $*" >&2
-  exit 1
-}
+Project = namedtuple("Project", "cwd proj gitdir")
+Profile = namedtuple("Profile", "name dir net volume")
 
-# Print a list file without comments and blank lines, with a leading ~ expanded.
-entries() {
-  sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' -e "s|^~|$HOME|" "$1"
-}
 
-# Set the names that belong to a profile.
-use_profile() {
-  profile=$1
-  dir="$conf/profiles/$profile"
-  net="jail-$profile"
-  volume="$net-home"
-}
+def die(message):
+    print(f"jAIl: {message}", file=sys.stderr)
+    sys.exit(1)
 
-# Print the one profile whose paths match a project; fail if none or several do.
-profile_for() {
-  local paths name pattern found=() why=()
-  for paths in "$conf"/profiles/*/paths; do
-    name=$(basename "${paths%/paths}")
-    while read -r pattern; do
-      # shellcheck disable=SC2053 # the pattern is a glob on purpose
-      if [[ $1 == $pattern ]]; then
-        found+=("$name")
-        why+=("$name ($pattern)")
-      fi
-    done < <(entries "$paths")
-  done
-  if ((${#found[@]} != 1)); then die "$1 must match exactly one profile; matches: ${why[*]:-none}"; fi
-  echo "${found[0]}"
-}
 
-# Start the profile's proxy, reachable as jail-proxy on the profile's internal network.
-start_proxy() {
-  if ! podman network exists "$net"; then podman network create --internal "$net" >/dev/null; fi
-  if ! podman network exists jail-out; then podman network create jail-out >/dev/null; fi
-  if ! podman container exists "$net-proxy"; then
-    podman create --name "$net-proxy" --network jail-out --network "$net:alias=jail-proxy" \
-      -v "$dir/allowlist:/etc/tinyproxy/allowlist:ro,z" \
-      --entrypoint tinyproxy jail -d -c /etc/tinyproxy/tinyproxy.conf >/dev/null
-  fi
-  podman start "$net-proxy" >/dev/null
-}
+def podman(*args, quiet=True):
+    """Run podman; on failure, exit with its status."""
+    stdout = None
+    if quiet:
+        stdout = subprocess.DEVNULL
+    status = subprocess.run(["podman", *args], stdout=stdout).returncode
+    if status != 0:
+        sys.exit(status)
 
-# Print the files in a project whose names are in the masks file.
-masked_files() {
-  local names=(-false) m
-  while read -r m; do names+=(-o -name "$m"); done < <(entries "$conf/masks")
-  find "$1" \( -name .git -o -name node_modules \) -prune -o \( "${names[@]}" \) ! -type d -print
-}
 
-# Set the current folder, the project (git toplevel, or else the current folder) and its git dir.
-find_project() {
-  cwd=$(pwd -P)
-  proj=$cwd
-  gitdir=''
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    proj=$(git rev-parse --show-toplevel)
-    gitdir=$(git rev-parse --path-format=absolute --git-common-dir)
-  fi
-}
+def podman_ok(*args):
+    return subprocess.run(["podman", *args], stdout=subprocess.DEVNULL).returncode == 0
 
-login() {
-  local cwd proj gitdir found
-  find_project
-  found=$(profile_for "$proj")
-  use_profile "$found"
-  echo "jAIl: logging in for profile $profile"
-  exec podman run "${base[@]}" -v "$volume:$HOME" --entrypoint opencode jail auth login
-}
 
-# Create a profile, and the masks file if there isn't one.
-new_profile() {
-  if [[ ! ${1:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then die "usage: jail new <profile>, a name of letters, digits, _ . -"; fi
-  use_profile "$1"
-  if [[ -e $dir ]]; then die "$dir already exists"; fi
-  mkdir -p "$dir/home/.config/opencode"
-  echo "# Project paths for this profile, one glob per line, such as ~/src/*" >"$dir/paths"
-  printf '%s\n' "# Hosts this profile can reach, one per line" models.dev models.opencode.ai >"$dir/allowlist"
-  if [[ ! -e $conf/masks ]]; then
-    printf '%s\n' "# File names to hide in every project, one per line" .env '.env.*' >"$conf/masks"
-  fi
-  echo "jAIl: created profile $1; review the files in $conf before use, the README explains each one"
-}
+def exec_podman(*args):
+    sys.stdout.flush()
+    os.execvp("podman", ["podman", *args])
 
-# Rebuild the image from scratch and remove the proxies, so they restart on the new image.
-build() {
-  local src proxies
-  src=$(dirname "$(readlink -f "$0")")/image
-  podman build --pull=always --no-cache -t jail "$src"
-  mapfile -t proxies < <(podman container ls -a --format '{{.Names}}' | grep -E '^jail-.+-proxy$' || true)
-  if ((${#proxies[@]} > 0)); then podman rm -f "${proxies[@]}" >/dev/null; fi
-}
 
-run() { # podman run arguments after the options: image and command
-  local cwd proj gitdir found masked f args m
-  find_project
-  found=$(profile_for "$proj")
-  use_profile "$found"
-  start_proxy
-  mapfile -t masked < <(masked_files "$proj")
+def entries(path):
+    """The lines of a list file, without comments and blank lines, with a leading ~ expanded."""
+    with open(path) as f:
+        lines = [re.sub(r"#.*", "", line).strip() for line in f]
+    return [expand(line) for line in lines if line]
 
-  args=("${base[@]}" --network "$net" -w "$cwd"
-    -v "$volume:$HOME"
-    -v "$proj:$proj:z"
-    -e http_proxy="$proxy" -e https_proxy="$proxy" -e no_proxy="localhost,127.0.0.1"
-    -e JAIL_PROFILE="$profile"
-    -e JAIL_HOST_KERNEL="$(uname -r)"
-    -e JAIL_GIT_DIR="$gitdir"
-    -e JAIL_MASKED="$(printf '%s\n' "${masked[@]}")"
-  )
-  if [[ -n $gitdir ]]; then args+=(-v "$gitdir:$gitdir:ro,z"); fi
-  if [[ -f $proj/.git ]]; then args+=(-v "$proj/.git:$proj/.git:ro,z"); fi
-  if [[ -f $dir/mounts ]]; then
-    while read -r m; do
-      if [[ ! -e $m ]]; then die "$m in $dir/mounts doesn't exist"; fi
-      args+=(-v "$m:$m:ro,z")
-    done < <(entries "$dir/mounts")
-  fi
-  if [[ -d $dir/home ]]; then args+=(-v "$dir/home:/jail/home:ro,z"); fi
-  for f in "${masked[@]}"; do
-    echo "jAIl: masked $f"
-    args+=(-v "/dev/null:$f:ro")
-  done
 
-  printf '\e]2;jAIl: %s\a' "$profile"
-  echo "jAIl: profile $profile, project $proj"
-  exec podman run "${args[@]}" "$@"
-}
+def expand(line):
+    if line.startswith("~"):
+        return HOME + line[1:]
+    return line
 
-case ${1:-} in
-  login) login ;;
-  new) new_profile "${2:-}" ;;
-  build) build ;;
-  shell) run --entrypoint bash jail ;;
-  --) run jail opencode "${@:2}" ;;
-  *) run jail opencode "$@" ;;
-esac
+
+def profile(name):
+    net = f"jail-{name}"
+    return Profile(name, f"{CONF}/profiles/{name}", net, f"{net}-home")
+
+
+def profile_for(proj):
+    """The one profile whose paths match a project; fail if none or several do."""
+    found = [
+        (os.path.basename(os.path.dirname(paths)), pattern)
+        for paths in sorted(glob(f"{CONF}/profiles/*/paths"))
+        for pattern in entries(paths)
+        if fnmatchcase(proj, pattern)
+    ]
+    if len(found) != 1:
+        why = " ".join(f"{name} ({pattern})" for name, pattern in found)
+        if not why:
+            why = "none"
+        die(f"{proj} must match exactly one profile; matches: {why}")
+    return profile(found[0][0])
+
+
+def start_proxy(p):
+    """Start the profile's proxy, reachable as jail-proxy on the profile's internal network."""
+    if not podman_ok("network", "exists", p.net):
+        podman("network", "create", "--internal", p.net)
+    if not podman_ok("network", "exists", "jail-out"):
+        podman("network", "create", "jail-out")
+    if not podman_ok("container", "exists", f"{p.net}-proxy"):
+        podman("create", "--name", f"{p.net}-proxy", "--network", "jail-out", "--network", f"{p.net}:alias=jail-proxy",
+               "-v", f"{p.dir}/allowlist:/etc/tinyproxy/allowlist:ro,z",
+               "--entrypoint", "tinyproxy", "jail", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf")
+    podman("start", f"{p.net}-proxy")
+
+
+def masked_files(proj):
+    """The files in a project whose names are in the masks file."""
+    masks_file = f"{CONF}/masks"
+    if not os.path.exists(masks_file):
+        return []
+    masks = entries(masks_file)
+    skipped = (".git", "node_modules")
+    found = []
+    for root, dirs, files in os.walk(proj):
+        dirs[:] = [d for d in dirs if d not in skipped]
+        links = [d for d in dirs if os.path.islink(os.path.join(root, d))]
+        names = [n for n in files + links if n not in skipped and any(fnmatchcase(n, m) for m in masks)]
+        found += [os.path.join(root, n) for n in names]
+    return found
+
+
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+
+def find_project():
+    """The current folder, the project (git toplevel, or else the current folder) and its git dir."""
+    cwd = os.getcwd()
+    if git("rev-parse", "--is-inside-work-tree").returncode != 0:
+        return Project(cwd, cwd, "")
+    proj = git("rev-parse", "--show-toplevel").stdout.strip()
+    gitdir = git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return Project(cwd, proj, gitdir)
+
+
+def login():
+    p = profile_for(find_project().proj)
+    print(f"jAIl: logging in for profile {p.name}")
+    exec_podman("run", *BASE, "-v", f"{p.volume}:{HOME}", "--entrypoint", "opencode", "jail", "auth", "login")
+
+
+def new_profile(name):
+    """Create a profile, and the masks file if there isn't one."""
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+        die("usage: jail new <profile>, a name of letters, digits, _ . -")
+    p = profile(name)
+    if os.path.exists(p.dir):
+        die(f"{p.dir} already exists")
+    os.makedirs(f"{p.dir}/home/.config/opencode")
+    write(f"{p.dir}/paths", "# Project paths for this profile, one glob per line, such as ~/src/*")
+    write(f"{p.dir}/allowlist", "# Hosts this profile can reach, one per line", "models.dev", "models.opencode.ai")
+    if not os.path.exists(f"{CONF}/masks"):
+        write(f"{CONF}/masks", "# File names to hide in every project, one per line", ".env", ".env.*")
+    print(f"jAIl: created profile {name}; review the files in {CONF} before use, the README explains each one")
+
+
+def write(path, *lines):
+    with open(path, "w") as f:
+        f.writelines(f"{line}\n" for line in lines)
+
+
+def build():
+    """Rebuild the image from scratch and remove the proxies, so they restart on the new image."""
+    src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "image")
+    podman("build", "--pull=always", "--no-cache", "-t", "jail", src, quiet=False)
+    names = subprocess.run(["podman", "container", "ls", "-a", "--format", "{{.Names}}"],
+                           capture_output=True, text=True).stdout.split()
+    proxies = [n for n in names if re.fullmatch(r"jail-.+-proxy", n)]
+    if proxies:
+        podman("rm", "-f", *proxies)
+
+
+def run(*tail):
+    """Run the sandbox; tail is what podman run gets after the options: image and command."""
+    project = find_project()
+    p = profile_for(project.proj)
+    start_proxy(p)
+    masked = masked_files(project.proj)
+
+    args = [*BASE, "--network", p.net, "-w", project.cwd,
+            "-v", f"{p.volume}:{HOME}",
+            "-v", f"{project.proj}:{project.proj}:z",
+            "-e", f"http_proxy={PROXY}", "-e", f"https_proxy={PROXY}", "-e", "no_proxy=localhost,127.0.0.1",
+            "-e", f"JAIL_PROFILE={p.name}",
+            "-e", f"JAIL_HOST_KERNEL={os.uname().release}",
+            "-e", f"JAIL_GIT_DIR={project.gitdir}",
+            "-e", "JAIL_MASKED=" + "\n".join(masked)]
+    if project.gitdir:
+        args += ["-v", f"{project.gitdir}:{project.gitdir}:ro,z"]
+    if os.path.isfile(f"{project.proj}/.git"):
+        args += ["-v", f"{project.proj}/.git:{project.proj}/.git:ro,z"]
+    if os.path.isfile(f"{p.dir}/mounts"):
+        for m in entries(f"{p.dir}/mounts"):
+            if not os.path.exists(m):
+                die(f"{m} in {p.dir}/mounts doesn't exist")
+            args += ["-v", f"{m}:{m}:ro,z"]
+    if os.path.isdir(f"{p.dir}/home"):
+        args += ["-v", f"{p.dir}/home:/jail/home:ro,z"]
+    for f in masked:
+        print(f"jAIl: masked {f}")
+        args += ["-v", f"/dev/null:{f}:ro"]
+
+    print(f"\033]2;jAIl: {p.name}\a", end="")
+    print(f"jAIl: profile {p.name}, project {project.proj}")
+    exec_podman("run", *args, *tail)
+
+
+def main(args):
+    if args[:1] == ["login"]:
+        login()
+    elif args[:1] == ["new"]:
+        new_profile(" ".join(args[1:2]))
+    elif args[:1] == ["build"]:
+        build()
+    elif args[:1] == ["shell"]:
+        run("--entrypoint", "bash", "jail")
+    elif args[:1] == ["--"]:
+        run("jail", "opencode", *args[1:])
+    else:
+        run("jail", "opencode", *args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

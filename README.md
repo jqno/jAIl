@@ -16,7 +16,7 @@ It's not a guarantee. See [Threat coverage](#threat-coverage) for what it does a
 
 ## Setup
 
-You need Linux with KVM, Bash 4+, rootless Podman 4+ with the krun runtime, and git. (Using a Mac? See [macOS](#macos).)
+You need Linux with KVM, Python 3.9+, rootless Podman 4+ with the krun runtime, and git. (Using a Mac? See [macOS](#macos).)
 
 1. Install the krun runtime. On Fedora:
    ```
@@ -252,4 +252,3 @@ An agent becomes dangerous when it combines private data, untrusted content and 
 jAIl probably doesn't work on macOS. It hasn't been tried, but:
 - On macOS, Podman already runs its containers in a Linux VM (`podman machine`). The krun runtime would have to start a second VM inside that one, which needs nested virtualization. Apple Silicon only offers that on M3 or newer with macOS 15+, and Podman's VM doesn't turn it on.
 - The project folder reaches the containers through Podman's VM, over a shared filesystem. That changes how file ownership and the same-path mounts behave.
-- macOS ships Bash 3.2, and the launcher needs Bash 4+.
